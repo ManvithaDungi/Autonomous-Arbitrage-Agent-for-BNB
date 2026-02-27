@@ -48,7 +48,7 @@ st.divider()
 # ── Controls ──
 col_token, col_run = st.columns([2, 1])
 with col_token:
-    token = st.selectbox("Token", ["BNB", "CAKE", "BTCB", "ETH"], label_visibility="collapsed")
+    token = st.selectbox("Token", ["BNB"], label_visibility="collapsed")
 with col_run:
     run_btn = st.button("🚀 Run Full Analysis", use_container_width=True, type="primary")
 
@@ -64,7 +64,8 @@ if run_btn:
     st.success(f"✅ {len(df)} items from {df['source'].nunique()} sources")
 
     with st.expander("📋 Raw Data Sample"):
-        st.dataframe(df[["source", "title", "timestamp", "engagement"]].head(20), use_container_width=True)
+        cols = [c for c in ["source", "title", "timestamp"] if c in df.columns]
+        st.dataframe(df[cols].head(20), use_container_width=True)
 
     # ── On-Chain Intelligence ──
     with st.spinner("⛓️ Running on-chain intelligence..."):
