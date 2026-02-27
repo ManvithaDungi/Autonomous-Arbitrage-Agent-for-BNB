@@ -79,7 +79,7 @@ class RSSIngester:
 # 5. CRYPTOPANIC (Crypto-specific news aggregator)
 # ─────────────────────────────────────────
 class CryptoPanicIngester:
-    BASE_URL = "https://cryptopanic.com/api/v1/posts/"
+    BASE_URL = "https://cryptopanic.com/api/developer/v2/posts/"
 
     def fetch(self, currencies="BNB,CAKE"):
         results = []
@@ -113,10 +113,21 @@ class CryptoPanicIngester:
 # ─────────────────────────────────────────
 class GoogleTrendsIngester:
     def __init__(self):
-        self.pytrends = TrendReq(hl='en-US', tz=360)
+        self.pytrends = None
+
+    def _ensure_connected(self):
+        if self.pytrends is None:
+            try:
+                self.pytrends = TrendReq(hl='en-US', tz=360, timeout=(5, 10))
+            except Exception as e:
+                print(f"[GoogleTrends Init Error] {e}")
+                return False
+        return True
 
     def fetch(self, keywords):
         results = []
+        if not self._ensure_connected():
+            return results
         try:
             self.pytrends.build_payload(keywords[:5], cat=0, timeframe='now 1-d', geo='')
             interest = self.pytrends.interest_over_time()

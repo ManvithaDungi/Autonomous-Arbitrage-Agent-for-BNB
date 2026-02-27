@@ -30,6 +30,7 @@ Thumbs.db
 
 # Logs
 *.log
+trade_log.json
 
 # Distribution
 *.whl
