@@ -163,22 +163,22 @@ class DEXPriceFetcher:
             return 0.0
 
     def get_dex_price(self, token_symbol: str) -> float:
-        """Try all 3 methods in order, return first non-zero price."""
-
+        """
+        Real DEX price only — subgraph first, router second.
+        Does NOT fall back to CoinGecko (that's the CEX price source — same price = 0% diff).
+        Returns 0.0 if both fail, which keeps price_diff at 0 rather than fake 0%.
+        """
         # Method 1: Subgraph
         price = self._price_from_subgraph_v3(token_symbol)
         if price > 0:
             print(f"    💱 DEX price ({token_symbol}) from subgraph: ${price:.4f}")
             return price
 
-        # Method 2: On-chain router
+        # Method 2: On-chain PancakeSwap v2 router
         price = self._price_from_router(token_symbol)
         if price > 0:
             print(f"    💱 DEX price ({token_symbol}) from router: ${price:.4f}")
             return price
 
-        # Method 3: CoinGecko (always works, treat as reference price)
-        price = self._price_from_coingecko(token_symbol)
-        if price > 0:
-            print(f"    💱 DEX price ({token_symbol}) from CoinGecko fallback: ${price:.4f}")
-        return price
+        print(f"    ⚠️  No real DEX price found for {token_symbol} — skipping comparison")
+        return 0.0

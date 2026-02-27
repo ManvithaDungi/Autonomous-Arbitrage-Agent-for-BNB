@@ -14,56 +14,67 @@ cfg = Config()
 
 
 # ═══════════════════════════════════════════════════════════════
-# MCP CLIENT — Talks to the bnbchain-mcp server via JSON-RPC
+# MCP CLIENT — Talks to the bnbchain-mcp server via SSE (MCP SDK)
 # ═══════════════════════════════════════════════════════════════
 class MCPClient:
-    """HTTP client for the bnbchain-mcp server."""
+    """SSE-based MCP client using the official mcp Python SDK."""
 
     def __init__(self, base_url: str = None):
-        self.base_url = (base_url or os.getenv("MCP_SERVER_URL", "http://localhost:3000")).rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
+        self.base_url = (base_url or os.getenv("MCP_SERVER_URL", "http://localhost:3001")).rstrip("/")
+        self.sse_url = f"{self.base_url}/sse"
         self._tools_cache = None
 
-    def discover_tools(self) -> list:
-        """Fetch available tools from the MCP server (GET /tools)."""
+    def _run_async(self, coro):
+        """Run an async coroutine synchronously (from sync context)."""
+        import asyncio
         try:
-            resp = self.session.get(f"{self.base_url}/tools", timeout=10)
-            resp.raise_for_status()
-            self._tools_cache = resp.json()
-            return self._tools_cache
-        except Exception as e:
-            print(f"  ❌ MCP tool discovery failed: {e}")
-            return []
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError
+            return loop.run_until_complete(coro)
+        except RuntimeError:
+            return asyncio.run(coro)
+
+    def discover_tools(self) -> list:
+        """Fetch available tools from the MCP server."""
+        async def _do():
+            try:
+                from mcp.client.sse import sse_client
+                from mcp import ClientSession
+                async with sse_client(self.sse_url) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        result = await session.list_tools()
+                        self._tools_cache = [t.model_dump() for t in result.tools]
+                        return self._tools_cache
+            except Exception as e:
+                print(f"  ❌ MCP tool discovery failed: {e}")
+                return []
+        return self._run_async(_do())
 
     def call_tool(self, tool_name: str, arguments: dict, timeout: int = 30) -> dict:
-        """
-        Invoke an MCP tool via POST /call-tool (standard MCP HTTP endpoint).
-        Payload: { "name": "<tool>", "arguments": { ... } }
-        """
-        payload = {
-            "name": tool_name,
-            "arguments": arguments,
-        }
-        try:
-            resp = self.session.post(
-                f"{self.base_url}/call-tool",
-                json=payload,
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.Timeout:
-            return {"error": f"MCP call to '{tool_name}' timed out after {timeout}s"}
-        except requests.exceptions.ConnectionError:
-            return {"error": f"Cannot connect to MCP server at {self.base_url}"}
-        except Exception as e:
-            return {"error": str(e)}
+        """Invoke an MCP tool by name with arguments via SSE."""
+        async def _do():
+            try:
+                from mcp.client.sse import sse_client
+                from mcp import ClientSession
+                async with sse_client(self.sse_url) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        result = await session.call_tool(tool_name, arguments)
+                        # Extract text content from response
+                        content = result.content
+                        if content and hasattr(content[0], "text"):
+                            return {"result": content[0].text, "content": [c.model_dump() for c in content]}
+                        return {"result": str(content)}
+            except Exception as e:
+                return {"error": str(e)}
+        return self._run_async(_do())
 
     def is_alive(self) -> bool:
-        """Quick health check — try to discover tools."""
+        """Quick health check — ping the SSE endpoint."""
         try:
-            resp = self.session.get(f"{self.base_url}/tools", timeout=5)
+            resp = requests.get(self.sse_url, timeout=5, stream=True)
             return resp.status_code == 200
         except:
             return False

@@ -110,9 +110,14 @@ class DecisionAgent:
                 confidence += 5
 
         confidence = max(0, min(100, confidence))
-        arb_confirmed = (sentiment_trigger and price_trigger) or \
-                        (arb_opportunity and confidence > 40) or \
-                        (phase == "MOMENTUM_BUILDING" and price_diff_pct > 0.005)
+
+        # arb_confirmed: ANY of these conditions triggers it
+        arb_confirmed = (
+            (sentiment_trigger and price_trigger) or          # strong sentiment + real price diff
+            (arb_opportunity and confidence > 30) or          # Gemini says YES
+            (price_diff_pct > 0.005 and dex_price > 0) or    # ≥0.5% real DEX diff (key fix)
+            (phase == "MOMENTUM_BUILDING" and price_diff_pct > 0.003)
+        )
 
         decision = {
             "token": token,
@@ -148,13 +153,15 @@ class DecisionAgent:
         return decision
 
     def _determine_action(self, arb_confirmed, confidence, signal, risk_level="MEDIUM"):
-        if risk_level == "HIGH" and confidence < 70:
-            return "HOLD"  # Don't trade in high risk unless very confident
-        if not arb_confirmed or confidence < 30:
+        if risk_level == "HIGH" and confidence < 60:
+            return "HOLD"  # High risk needs more confidence
+        if not arb_confirmed or confidence < 20:
             return "HOLD"
-        if confidence >= 70 and abs(signal) > 0.5:
+        if confidence >= 60 and abs(signal) > 0.3:
+            return "EXECUTE_TRADE"   # relaxed: was 70 + 0.5
+        if confidence >= 60:          # confident but low sentiment - still trade
             return "EXECUTE_TRADE"
-        if confidence >= 40:
+        if confidence >= 30:
             return "PAPER_TRADE"
         return "MONITOR"
 
