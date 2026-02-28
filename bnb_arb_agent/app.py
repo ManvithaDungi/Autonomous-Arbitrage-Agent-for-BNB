@@ -463,6 +463,7 @@ def create_app() -> Flask:
     @app.route("/api/trade", methods=["POST", "GET"])
     def api_trade():
         token_requested = _get_param("token", "BUSD") or "BUSD"
+        force_trade = str(_get_param("force", "false")).lower() in {"1", "true", "yes"}
         token = token_requested
         warning = None
         try:
@@ -475,9 +476,16 @@ def create_app() -> Flask:
         try:
             from demo_trade import run_live_demo
 
-            result = run_live_demo(token=token)
+            result = run_live_demo(token=token, force_trade=force_trade)
             status_code = 200 if result.get("status") == "SUCCESS" else 400
-            payload = {"step": "Trade", "status": "ok", "result": result, "token_requested": token_requested, "token_used": token}
+            payload = {
+                "step": "Trade",
+                "status": "ok",
+                "result": result,
+                "token_requested": token_requested,
+                "token_used": token,
+                "force_trade": force_trade,
+            }
             if warning:
                 payload["warning"] = warning
             return jsonify(payload), status_code

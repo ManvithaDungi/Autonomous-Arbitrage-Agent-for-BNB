@@ -176,7 +176,7 @@ export default function Chat() {
     setTradeResult(null);
     try {
       const tokenSymbol = selectedTokens[0]?.symbol || recommendedToken?.token || "BUSD";
-      const response = await fetch(`${API_BASE}/api/trade?token=${encodeURIComponent(tokenSymbol)}`, {
+      const response = await fetch(`${API_BASE}/api/trade?token=${encodeURIComponent(tokenSymbol)}&force=true`, {
         method: "POST",
       });
       const data = await response.json();

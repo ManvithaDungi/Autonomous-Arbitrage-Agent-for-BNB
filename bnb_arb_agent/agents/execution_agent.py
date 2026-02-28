@@ -15,7 +15,9 @@ import requests
 
 from core.constants import (
     BSC_TESTNET_CHAIN_ID,
+    BSC_TESTNET_RPC,
     PANCAKE_V2_ROUTER_TESTNET,
+    ROUTER_ABI,
     ROUTER_ABI_JSON,
     SWAP_ABI_JSON,
     TESTNET_TOKENS,
@@ -216,6 +218,8 @@ class ExecutionAgent:
         self._wallet         = os.getenv("WALLET_ADDRESS", "")
         self._amount_bnb     = float(os.getenv("TRADE_AMOUNT_BNB", "0.01"))
         self._min_profit     = float(os.getenv("MIN_PROFIT_THRESHOLD", "0.005"))
+        self._min_profit_bnb = float(os.getenv("MIN_PROFIT_BNB", "0.000002"))
+        self._gas_estimate_bnb = float(os.getenv("GAS_ESTIMATE_BNB", "0"))
 
     def execute(self, decision: dict) -> dict:
         token      = decision.get("token", "BNB")
@@ -270,6 +274,87 @@ class ExecutionAgent:
             profit_pct=price_diff,
             amount_out=buy.get('amount_out_wei', 0)
         )
+        self._logger.log(result)
+        self._breaker.record_success()
+        return result
+
+    def execute_two_leg(self, decision: dict) -> dict:
+        token      = decision.get("token", "BUSD")
+        direction  = decision.get("direction", "BUY_DEX_SELL_CEX")
+        price_diff = decision.get("price_diff_pct", 0.0)
+        force_trade = bool(decision.get("force_trade", False))
+
+        if not self._breaker.allow_trade():
+            return self._build_result(token, direction, "BLOCKED_CIRCUIT_BREAKER", "Circuit breaker is open.", decision)
+
+        preflight = self._preflight(token, direction, price_diff)
+        if not preflight["passed"]:
+            result = self._build_result(token, direction, "PREFLIGHT_FAILED", preflight["reason"], decision)
+            self._logger.log(result)
+            self._breaker.record_failure()
+            return result
+
+        amount_wei = self._to_wei(self._amount_bnb)
+        buy_path = self._buy_path(token)
+        sell_path = self._sell_path(token)
+        if not buy_path or not sell_path:
+            return self._build_result(token, direction, "PREFLIGHT_FAILED", "Invalid swap path for token.", decision)
+
+        gas_estimate_bnb = self._estimate_gas_bnb(amount_wei, buy_path, sell_path) or self._gas_estimate_bnb
+
+        buy_quote = self._get_amounts_out(amount_wei, buy_path)
+        if not buy_quote:
+            return self._build_result(token, direction, "PREFLIGHT_FAILED", "Unable to quote buy route.", decision)
+        expected_token_out = int(buy_quote[-1])
+
+        sell_quote = self._get_amounts_out(expected_token_out, sell_path)
+        if not sell_quote:
+            return self._build_result(token, direction, "PREFLIGHT_FAILED", "Unable to quote sell route.", decision)
+        expected_wbnb_out = int(sell_quote[-1])
+
+        expected_profit_wei = expected_wbnb_out - amount_wei
+        expected_profit_bnb = expected_profit_wei / 1e18
+        if not force_trade and expected_profit_bnb - gas_estimate_bnb < self._min_profit_bnb:
+            reason = (
+                f"Expected profit {expected_profit_bnb:.6f} WBNB below minimum "
+                f"{self._min_profit_bnb:.6f} WBNB after gas estimate {gas_estimate_bnb:.6f}."
+            )
+            result = self._build_result(token, direction, "PREFLIGHT_FAILED", reason, decision)
+            self._logger.log(result)
+            return result
+
+        buy = self._swap_native_for_token(token, amount_wei)
+        if buy.get("error"):
+            result = self._build_result(token, direction, "FAILED", f"Buy-side failed: {buy['error']}", decision)
+            self._logger.log(result)
+            self._breaker.record_failure()
+            return result
+
+        sell = self._swap_token_for_token(token, buy.get("amount_out_wei", 0))
+        if sell.get("error"):
+            result = self._build_result(token, direction, "FAILED", f"Sell-side failed: {sell['error']}", decision)
+            self._logger.log(result)
+            self._breaker.record_failure()
+            return result
+
+        actual_profit_wei = sell.get("amount_out_wei", 0) - amount_wei
+        actual_profit_bnb = actual_profit_wei / 1e18
+
+        result = self._build_result(
+            token,
+            direction,
+            "SUCCESS",
+            "Two-leg DEX swap executed on testnet.",
+            decision,
+            tx_hash=f"BUY:{buy['tx_hash']}|SELL:{sell['tx_hash']}",
+            profit_pct=price_diff,
+            amount_out=sell.get("amount_out_wei", 0),
+        )
+        result["profit_wbnb"] = round(actual_profit_bnb, 8)
+        result["gas_estimate_bnb"] = round(gas_estimate_bnb, 8)
+        result["force_trade"] = force_trade
+        result["buy_tx_hash"] = buy.get("tx_hash")
+        result["sell_tx_hash"] = sell.get("tx_hash")
         self._logger.log(result)
         self._breaker.record_success()
         return result
@@ -338,35 +423,9 @@ class ExecutionAgent:
         logger.info(f"Approval successful, getting quote...")
         
         # Step 2: Get quote
-        quote = self._mcp.call_tool(
-            "read_contract",
-            {
-                "contractAddress": PANCAKE_V2_ROUTER_TESTNET,
-                "abi": json.loads(ROUTER_ABI_JSON),
-                "functionName": "getAmountsOut",
-                "args": [str(amount_wei), path],
-                "network": "bsc-testnet",
-            },
-        )
-        
-        if quote.get("error"):
-            return {"error": f"Quote failed: {quote['error']}"}
-
-        # Parse the quote result
-        result = quote.get("result")
-        if isinstance(result, str):
-            try:
-                amounts = json.loads(result)
-            except json.JSONDecodeError:
-                return {"error": f"Invalid quote format: {result}"}
-        elif isinstance(result, list):
-            amounts = result
-        else:
-            return {"error": f"Unexpected quote result type: {type(result)}"}
-        
-        if not amounts or len(amounts) < 2:
-            return {"error": f"Invalid amounts from quote: {amounts}"}
-        
+        amounts = self._get_amounts_out(amount_wei, path)
+        if not amounts:
+            return {"error": "Quote failed."}
         expected_out = int(amounts[-1])
         if expected_out <= 0:
             return {"error": f"Quote returned zero or negative output: {expected_out}"}
@@ -394,6 +453,59 @@ class ExecutionAgent:
         
         result = self._mcp.call_tool("write_contract", swap_params)
         if result.get("error"): 
+            return {"error": f"Swap failed: {result['error']}"}
+        tx_hash = self._extract_tx_hash(result)
+        content = result.get("content", [])
+        if not tx_hash or tx_hash == "unknown":
+            for item in content:
+                text = item.get("text", "") if isinstance(item, dict) else str(item)
+                match = _TX_HASH_PATTERN.search(text)
+                if match:
+                    tx_hash = match.group(1)
+                    break
+        if not tx_hash or tx_hash == "unknown":
+            return {"error": "Swap response did not include a transaction hash."}
+        return {"tx_hash": tx_hash, "amount_out_wei": expected_out}
+
+    def _swap_token_for_token(self, token: str, amount_in_wei: int) -> dict:
+        """Swap token -> WBNB via router (testnet)."""
+        path = self._sell_path(token)
+        if not path:
+            return {"error": "Invalid sell path."}
+        token_in = path[0]
+
+        approve_result = self._mcp.call_tool(
+            "write_contract",
+            {
+                "contractAddress": token_in,
+                "abi": ERC20_APPROVE_ABI,
+                "functionName": "approve",
+                "args": [PANCAKE_V2_ROUTER_TESTNET, str(amount_in_wei * 2)],
+                "network": "bsc-testnet",
+            },
+        )
+        if approve_result.get("error"):
+            return {"error": f"Approval failed: {approve_result['error']}"}
+
+        amounts = self._get_amounts_out(amount_in_wei, path)
+        if not amounts:
+            return {"error": "Quote failed."}
+        expected_out = int(amounts[-1])
+        if expected_out <= 0:
+            return {"error": f"Quote returned zero or negative output: {expected_out}"}
+
+        min_out = str(max(1, int(expected_out * 0.01)))
+        deadline = int(time.time()) + 300
+        swap_args = [str(amount_in_wei), min_out, path, self._wallet, deadline]
+        swap_params = {
+            "contractAddress": PANCAKE_V2_ROUTER_TESTNET,
+            "abi": json.loads(SWAP_ABI_JSON),
+            "functionName": "swapExactTokensForTokens",
+            "args": swap_args,
+            "network": "bsc-testnet",
+        }
+        result = self._mcp.call_tool("write_contract", swap_params)
+        if result.get("error"):
             return {"error": f"Swap failed: {result['error']}"}
         tx_hash = self._extract_tx_hash(result)
         content = result.get("content", [])
@@ -468,6 +580,18 @@ class ExecutionAgent:
             return [wbnb, busd]
         return [wbnb, busd, token_addr]
 
+    @staticmethod
+    def _sell_path(token: str) -> list[str]:
+        wbnb = TESTNET_TOKENS["BNB"].lower()
+        busd = TESTNET_TOKENS["BUSD"].lower()
+        token_addr = TESTNET_TOKENS.get(token.upper())
+        if not token_addr:
+            return []
+        token_addr = token_addr.lower()
+        if token_addr == busd:
+            return [busd, wbnb]
+        return [token_addr, busd, wbnb]
+
     def _swap_pair(self, token: str, direction: str) -> tuple[str, str]:
         stable = TESTNET_TOKENS.get("BUSD", TESTNET_TOKENS["BNB"])
         token_addr = TESTNET_TOKENS.get(token, TESTNET_TOKENS["BNB"])
@@ -477,6 +601,110 @@ class ExecutionAgent:
     @staticmethod
     def _to_wei(amount: float, decimals: int = 18) -> int:
         return int(amount * (10 ** decimals))
+
+    def _get_amounts_out(self, amount_in_wei: int, path: list[str]) -> list[int] | None:
+        quote = self._mcp.call_tool(
+            "read_contract",
+            {
+                "contractAddress": PANCAKE_V2_ROUTER_TESTNET,
+                "abi": json.loads(ROUTER_ABI_JSON),
+                "functionName": "getAmountsOut",
+                "args": [str(amount_in_wei), path],
+                "network": "bsc-testnet",
+            },
+        )
+        if quote.get("error"):
+            return None
+        result = quote.get("result")
+        if isinstance(result, str):
+            try:
+                amounts = json.loads(result)
+            except json.JSONDecodeError:
+                return None
+        elif isinstance(result, list):
+            amounts = result
+        else:
+            return None
+        if not amounts or len(amounts) < 2:
+            return None
+        return [int(a) for a in amounts]
+
+    def _estimate_gas_bnb(self, amount_in_wei: int, buy_path: list[str], sell_path: list[str]) -> float | None:
+        if not self._wallet:
+            return None
+        try:
+            from web3 import Web3
+        except Exception:
+            return None
+
+        try:
+            web3 = Web3(Web3.HTTPProvider(BSC_TESTNET_RPC))
+            if not web3.is_connected():
+                return None
+
+            wallet = Web3.to_checksum_address(self._wallet)
+            router = web3.eth.contract(
+                address=Web3.to_checksum_address(PANCAKE_V2_ROUTER_TESTNET),
+                abi=ROUTER_ABI,
+            )
+
+            def checksum_path(path: list[str]) -> list[str]:
+                return [Web3.to_checksum_address(p) for p in path]
+
+            gas_price = web3.eth.gas_price
+            deadline = int(time.time()) + 300
+
+            total_gas = 0
+
+            # Approve WBNB for buy leg
+            wbnb = Web3.to_checksum_address(TESTNET_TOKENS["BNB"])
+            erc20 = web3.eth.contract(address=wbnb, abi=ERC20_APPROVE_ABI)
+            try:
+                gas = erc20.functions.approve(PANCAKE_V2_ROUTER_TESTNET, amount_in_wei * 2).estimate_gas({"from": wallet})
+                total_gas += gas
+            except Exception:
+                pass
+
+            # Buy swap
+            try:
+                gas = router.functions.swapExactTokensForTokens(
+                    amount_in_wei,
+                    1,
+                    checksum_path(buy_path),
+                    wallet,
+                    deadline,
+                ).estimate_gas({"from": wallet})
+                total_gas += gas
+            except Exception:
+                pass
+
+            # Approve token for sell leg
+            token_in = Web3.to_checksum_address(sell_path[0])
+            erc20_sell = web3.eth.contract(address=token_in, abi=ERC20_APPROVE_ABI)
+            try:
+                gas = erc20_sell.functions.approve(PANCAKE_V2_ROUTER_TESTNET, amount_in_wei * 2).estimate_gas({"from": wallet})
+                total_gas += gas
+            except Exception:
+                pass
+
+            # Sell swap
+            try:
+                gas = router.functions.swapExactTokensForTokens(
+                    amount_in_wei,
+                    1,
+                    checksum_path(sell_path),
+                    wallet,
+                    deadline,
+                ).estimate_gas({"from": wallet})
+                total_gas += gas
+            except Exception:
+                pass
+
+            if total_gas <= 0:
+                return None
+            return (total_gas * gas_price) / 1e18
+        except Exception:
+            return None
 
     def _build_result(self, token: str, direction: str, status: str, reason: str, decision: dict, tx_hash: str = "N/A", profit_pct: float = 0.0, amount_out: int = 0) -> dict:
         return {"token_in": token if direction == "BUY_CEX_SELL_DEX" else "BUSD", "token_out": "BUSD" if direction == "BUY_CEX_SELL_DEX" else token, "amount": self._amount_bnb, "amount_out_wei": amount_out, "direction": direction, "status": status, "tx_hash": tx_hash, "profit_estimate_pct": round(profit_pct, 4), "market_phase": decision.get("market_phase", "UNKNOWN"), "sentiment_signal": decision.get("sentiment_signal", 0.0), "confidence_score": decision.get("confidence_score", 0), "risk_level": decision.get("risk_level", "UNKNOWN"), "reason": reason or decision.get("reason", ""), "chain_id": BSC_TESTNET_CHAIN_ID, "router": PANCAKE_V2_ROUTER_TESTNET, "timestamp": datetime.utcnow().isoformat(), "circuit_breaker": self._breaker.status}
