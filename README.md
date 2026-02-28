@@ -27,7 +27,7 @@ Once approved, the system automatically executes the transaction using Solidity 
 ### Data Ingestion Agent 
 - **Price Oracles**: Real-time token prices (CoinGecko OHLCV)
 - **News & RSS Feeds**: Aggregates from GNews, TheNewsAPI, and multiple RSS feeds
-- **Web Scraping**: Custom parsers for crypto forums (Bitcointalk, etc.) 
+- **Web Scraping**: Custom parsers for crypto forums 
 - **Google Trends**: Search interest signals tracking retail momentum
 - **DEX Aggregators**: Multi-DEX price feeds (PancakeSwap, Biswap, 1inch)
 - **ask-ai-mcp**: Contextual RAG search across BNB Chain docs & BEPs
@@ -48,7 +48,7 @@ Fuses signals into a single confidence score using a LangGraph state-graph:
 - ** CryptoPanic (20%)**: Community news sentiment
 - ** Predict.fun (15%)**: Probabilistic forward bias
 
-### ⑥ Decision Agent
+### Decision Agent
 - Weighs fused 4-way sentiment against live CEX/DEX price disparities and market phase risk.
 - Outputs one of three actions: `✅ EXECUTE_TRADE`, `📋 PAPER_TRADE`, or `⏸ HOLD`
 
@@ -71,6 +71,6 @@ Fuses signals into a single confidence score using a LangGraph state-graph:
 - Node.js 18+ (for the BNBChain MCP server)
 - A BSC Testnet wallet funded with tBNB — faucet: https://testnet.bnbchain.org/faucet-smart
 
----
+
 
 
