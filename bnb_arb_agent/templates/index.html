@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BNB Arb Intelligence</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">BNB Chain AI Intelligence Agent</p>
+        <h1>On-chain signals, sentiment, and market phase prediction</h1>
+        <p class="subhead">Run a full intelligence sweep across web sources, on-chain monitors, and pricing signals.</p>
+      </div>
+      <div class="hero-meta">
+        <span class="pill">Live sources</span>
+        <span class="pill">Gemini + VADER fusion</span>
+        <span class="pill">BSC testnet safe mode</span>
+      </div>
+    </header>
+
+    <section class="panel">
+      <form class="controls" method="post" action="/run" id="run-form">
+        <label>
+          <span>Token</span>
+          <select name="token">
+            {% for t in tokens %}
+            <option value="{{ t }}" {% if result and result.token == t %}selected{% endif %}>{{ t }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button type="submit" class="primary">Run Full Analysis</button>
+      </form>
+      <p class="hint">Typical runtime: 30-90 seconds depending on data sources.</p>
+      {% if error %}
+      <div class="alert">{{ error }}</div>
+      {% endif %}
+    </section>
+
+    {% if result %}
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Data Ingestion</h2>
+        <span class="muted">Generated {{ result.generated_at }}</span>
+      </div>
+      <div class="stats">
+        <div class="stat">
+          <span class="stat-label">Items</span>
+          <span class="stat-value">{{ result.fetched_count }}</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Sources</span>
+          <span class="stat-value">{{ result.source_count }}</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Token</span>
+          <span class="stat-value">{{ result.token }}</span>
+        </div>
+      </div>
+      {% if result.sample_rows %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Title</th>
+              <th>Timestamp</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in result.sample_rows %}
+            <tr>
+              <td>{{ row.source }}</td>
+              <td>{{ row.title }}</td>
+              <td>{{ row.timestamp }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Predicted Market Phase</h2>
+        <span class="muted">Confidence {{ result.prediction.confidence }}/100</span>
+      </div>
+      <div class="phase-banner" style="border-color: {{ result.prediction.color }};">
+        <div class="phase-title" style="color: {{ result.prediction.color }};">
+          <span class="phase-icon">{{ result.prediction.icon }}</span>
+          {{ result.prediction.phase.replace('_', ' ') }}
+        </div>
+        <p>{{ result.prediction.recommendation }}</p>
+        <div class="phase-meta">
+          <span class="pill">Risk: {{ result.prediction.risk_level }}</span>
+          <span class="pill">Confidence: {{ result.prediction.confidence }}/100</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Signal Monitors</h2>
+        <span class="muted">7 live intelligence feeds</span>
+      </div>
+      <div class="grid">
+        {% for monitor in result.monitors %}
+        <div class="metric-card">
+          <div class="metric-label">{{ monitor.label }}</div>
+          <div class="metric-signal {{ monitor.class }}">{{ monitor.signal }}</div>
+          {% for detail in monitor.details %}
+          <div class="metric-detail">{{ detail }}</div>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Sentiment & Final Decision</h2>
+        <span class="muted">Gemini + VADER fusion</span>
+      </div>
+      <div class="decision-grid">
+        <div class="decision-card">
+          <span class="stat-label">Sentiment Signal</span>
+          <span class="stat-value">{{ "%+.3f"|format(result.sentiment.final_signal) }}</span>
+        </div>
+        <div class="decision-card">
+          <span class="stat-label">Price Diff</span>
+          <span class="stat-value">{{ result.decision.price_diff_pct }}%</span>
+          <span class="stat-detail">{{ result.decision.direction }}</span>
+        </div>
+        <div class="decision-card">
+          <span class="stat-label">Confidence</span>
+          <span class="stat-value">{{ result.decision.confidence }}/100</span>
+          <span class="stat-detail">{{ result.decision.risk_level }} risk</span>
+        </div>
+        <div class="decision-card highlight" style="border-color: {{ result.decision.action_color }};">
+          <span class="stat-label">Recommended Action</span>
+          <span class="stat-value" style="color: {{ result.decision.action_color }};">{{ result.decision.action }}</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Phase Probability Breakdown</h2>
+        <span class="muted">Relative score across phases</span>
+      </div>
+      <div class="bars">
+        {% for phase, prob in result.prediction.phase_probs %}
+        <div class="bar-row">
+          <span class="bar-label">{{ phase.replace('_', ' ') }}</span>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: {{ prob }}%;"></div>
+          </div>
+          <span class="bar-value">{{ prob }}%</span>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% else %}
+    <section class="panel welcome">
+      <div class="welcome-icon">🧠</div>
+      <h2>Select a token and run full analysis</h2>
+      <p>
+        Monitors: Buy/Sell Pressure · Whale Wallets · Social Velocity · Dev Activity · Liquidity · Narrative Keywords ·
+        Holder Distribution
+      </p>
+      <p class="muted">Predicts: Momentum Building · Distribution · Accumulation · Volatility Spikes</p>
+    </section>
+    {% endif %}
+  </div>
+
+  <div class="loading" id="loading" aria-hidden="true">
+    <div class="loader-card">
+      <div class="spinner"></div>
+      <h3>Running full analysis</h3>
+      <p>This can take up to 90 seconds depending on network sources.</p>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

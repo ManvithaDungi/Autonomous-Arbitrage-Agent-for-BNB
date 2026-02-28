@@ -280,14 +280,19 @@ class ExecutionAgent:
             return {"passed": False, "reason": "WALLET_ADDRESS is missing in .env"}
         if not self._mcp.is_alive():
             return {"passed": False, "reason": "MCP server is not reachable."}
+        if token.upper() not in TESTNET_TOKENS:
+            supported = ", ".join(sorted(TESTNET_TOKENS.keys()))
+            return {"passed": False, "reason": f"Unsupported token {token}. Supported: {supported}."}
         if token.upper() == "BNB":
-            return {"passed": False, "reason": "Token BNB is invalid for buy-on-DEX demo. Use CAKE/BUSD/USDT."}
+            return {"passed": False, "reason": "Token BNB is invalid for buy-on-DEX demo. Use CAKE/BUSD/USDT/DAI."}
 
         native_balance = self._mcp.call_tool("get_native_balance", {"address": self._wallet, "network": "bsc-testnet"})
         if native_balance.get("error"):
             return {"passed": False, "reason": f"Native balance check failed: {native_balance['error']}"}
 
         path = self._buy_path(token)
+        if len(path) < 2:
+            return {"passed": False, "reason": "Invalid swap path for token."}
         quote = self._mcp.call_tool(
             "read_contract",
             {
@@ -453,10 +458,12 @@ class ExecutionAgent:
     def _buy_path(token: str) -> list[str]:
         wbnb = TESTNET_TOKENS["BNB"].lower()
         busd = TESTNET_TOKENS["BUSD"].lower()
-        token_addr = TESTNET_TOKENS.get(token.upper(), TESTNET_TOKENS["BNB"])
+        token_addr = TESTNET_TOKENS.get(token.upper())
+        if not token_addr:
+            return []
         token_addr = token_addr.lower()
         if token_addr == wbnb:
-            return [wbnb]
+            return []
         if token_addr == busd:
             return [wbnb, busd]
         return [wbnb, busd, token_addr]

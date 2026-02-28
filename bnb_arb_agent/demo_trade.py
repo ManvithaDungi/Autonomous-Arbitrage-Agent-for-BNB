@@ -5,7 +5,7 @@ from agents.execution_agent import ExecutionAgent
 # Force UTF-8 for Windows PowerShell
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-def run_live_demo():
+def run_live_demo(token: str = "BUSD") -> dict:
     print("🔥 INITIATING LIVE TESTNET TRANSACTION DEMO 🔥")
     
     agent = ExecutionAgent()
@@ -14,7 +14,7 @@ def run_live_demo():
     price_gap_pct = 10.0 
     
     perfect_decision = {
-        "token": "BUSD",
+        "token": token,
         "direction": "BUY_DEX_SELL_CEX",
         "price_diff_pct": price_gap_pct,
         "market_phase": "HACKATHON_DEMO",
@@ -52,6 +52,23 @@ def run_live_demo():
         print("💰" * 15)
         
         print(f"\nView Transaction: https://testnet.bscscan.com/tx/{tx_hash.replace('BUY:', '')}")
+
+        return {
+            "status": "SUCCESS",
+            "token": token,
+            "tx_hash": tx_hash,
+            "spent_wbnb": spent_wbnb,
+            "bought_busd": bought_busd,
+            "price_gap_pct": price_gap_pct,
+            "profit_wbnb": arbitrage_profit_wbnb,
+        }
+
+    return {
+        "status": result.get("status", "FAILED"),
+        "token": token,
+        "tx_hash": result.get("tx_hash", ""),
+        "reason": result.get("reason", "Trade failed"),
+    }
 
 if __name__ == "__main__":
     run_live_demo()
