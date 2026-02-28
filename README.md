@@ -1,105 +1,120 @@
-# BNB Arb Intelligence Agent
+# BNB Chain AI Arbitrage Agent
 
-A full-stack, AI-powered arbitrage and intelligence dashboard for BNB Chain. This project combines on-chain analytics, news/sentiment ingestion, market phase prediction, and automated trade execution using the Model Context Protocol (MCP) and bnbchain-mcp server.
+An AI-powered arbitrage agent for BNB Chain that monitors sentiment, on-chain intelligence, and DEX/CEX price spreads to identify and execute arbitrage opportunities on BSC Testnet.
 
----
+## How It Works
 
-## 🚀 Quick Start
+1. Every 2 minutes, the agent fetches news from 10+ sources (RSS, GNews, Reddit, 4chan, CoinGecko trends, CryptoPanic)
+2. VADER scores all articles for sentiment; Gemini performs deep analysis on relevant ones
+3. On-chain intelligence checks whale wallet flows, dev activity, social growth, TVL, and holder distribution
+4. Decision agent combines all signals into a confidence score and confirms whether an arb opportunity exists
+5. If confirmed (≥0.5% DEX/CEX price diff and confidence ≥60), `ExecutionAgent` routes the trade through the BNBChain MCP server
+6. The MCP server signs and broadcasts the PancakeSwap swap on BSC Testnet using your private key
 
-1. **Install dependencies:**
-	- Python 3.9+
-	- `pip install -r requirements.txt` (ensure you have all required packages, including `streamlit`, `requests`, `pandas`, `bs4`, `feedparser`, `pytrends`, `langchain`, `langgraph`, `vaderSentiment`, etc.)
-	- Node.js (for MCP server integration)
-2. **Set up environment variables:**
-	- Copy `.env.example` to `.env` and fill in API keys (GNEWS, THENEWSAPI, CRYPTOPANIC, GOOGLE_API_KEY, BSCSCAN_API_KEY, etc.)
-	- Set your MCP server URL and PRIVATE_KEY for blockchain actions.
-3. **Run the dashboard:**
-	- `streamlit run bnb_arb_agent/dashboard.py`
+## Decision Logic
 
----
+| Condition | Action |
+|---|---|
+| `arb_confirmed = False` or `confidence < 20` | HOLD |
+| `confidence ≥ 60` | EXECUTE_TRADE |
+| `confidence ≥ 30` | PAPER_TRADE (logged only, no real tx) |
 
-## 🧩 Project Structure & Features
+`arb_confirmed` triggers when **any** of:
+- Sentiment >0.3 **and** DEX/CEX diff >0.5%
+- Gemini returns `ARB_OPPORTUNITY: YES`
+- Real on-chain DEX price differs from CoinGecko by ≥0.5%
+- Momentum phase detected with >0.3% spread
 
-### Main Dashboard
-- **dashboard.py**: Streamlit app for the intelligence dashboard. Lets you select a token, run full analysis, and view:
-  - On-chain intelligence (7 signal monitors)
-  - Sentiment analysis (Gemini + VADER)
-  - Market phase prediction (Momentum, Accumulation, Distribution, Volatility Spike)
-  - Final decision and recommended action (trade, hold, monitor)
+## Prerequisites
 
-### Core Agents
-- **agents/ingestion_agent.py**: Aggregates news, RSS, CryptoPanic, Google Trends, CoinGecko trending, and web scrapes (Bitcointalk, 4chan) for relevant data.
-- **agents/analysis_agent.py**: Fuses VADER sentiment and Gemini LLM analysis for robust sentiment scoring.
-- **agents/onchain_intelligence_agent.py**: Computes 7 on-chain signals (buy/sell pressure, whale flows, social growth, dev activity, liquidity, narrative, holder distribution) and predicts market phase.
-- **agents/decision_agent.py**: Combines sentiment, price data, and on-chain intelligence to recommend and trigger trades.
-- **agents/execution_agent.py**: Handles trade execution via MCP server, with pre-flight checks, swap simulation, logging, and circuit breaker.
+- Python 3.12+
+- Node.js 18+ (for the BNBChain MCP server)
+- A BSC Testnet wallet funded with tBNB — faucet: https://testnet.bnbchain.org/faucet-smart
 
-### Orchestration
-- **orchestrator.py**: Runs the full pipeline for all target tokens in a loop (ingestion → intelligence → analysis → decision → execution).
+## Setup
 
-### Config & Tools
-- **config.py**: Centralized config, loads all API keys and settings from environment variables.
-- **tools/price_fetcher.py**: Async utility for fetching token prices from CoinGecko.
-- **tools/scrapers.py**: Async utility for fetching news via GNews or RSS.
+### 1. Create environment and install dependencies
 
----
-
-## 🛠️ Key Features & Checks
-- **On-chain intelligence**: 7 monitors for market health and whale activity.
-- **Sentiment fusion**: Combines fast VADER and deep Gemini LLM for robust signals.
-- **Market phase prediction**: AI-driven phase classifier for actionable insights.
-- **Automated trade execution**: Via MCP server, with safety checks and logging.
-- **Circuit breaker**: Pauses trading after consecutive failures.
-- **Extensible ingestion**: Add new news, social, or on-chain sources easily.
-
----
-
-## ⚙️ Usage & Customization
-- Edit `config.py` or your `.env` to set API keys, MCP server URL, and trading parameters.
-- Add/remove tokens in `TARGET_TOKENS` in `config.py`.
-- To run the full pipeline in CLI mode: `python bnb_arb_agent/orchestrator.py`
-- To use the dashboard: `streamlit run bnb_arb_agent/dashboard.py`
-
----
-
-## 🧪 Testing & Validation
-- All major features are implemented and code is modular.
-- Each agent can be tested independently.
-- MCP integration is required for live trading; otherwise, the system runs in analysis/simulation mode.
-- Check logs and Streamlit output for errors or warnings.
-
----
-
-## 📂 File-by-File Analysis
-
-- **dashboard.py**: Main UI, orchestrates all agents, displays results, and handles user input.
-- **config.py**: Loads all config from environment variables, including API keys and trading settings.
-- **agents/ingestion_agent.py**: Fetches and filters news, trends, and social data from multiple sources.
-- **agents/analysis_agent.py**: Runs VADER and Gemini LLM, fuses results, and outputs sentiment.
-- **agents/onchain_intelligence_agent.py**: Implements all on-chain monitors and market phase prediction.
-- **agents/decision_agent.py**: Makes trade/hold/monitor decisions based on all signals and triggers execution.
-- **agents/execution_agent.py**: Handles all trade execution logic, MCP calls, logging, and circuit breaker.
-- **orchestrator.py**: Runs the full pipeline for all tokens in a loop, suitable for automation.
-- **tools/price_fetcher.py**: Async price fetch utility for CoinGecko.
-- **tools/scrapers.py**: Async news fetch utility for GNews and RSS.
-
----
-
-## 📝 Notes
-- Ensure all API keys are valid and MCP server is running for full functionality.
-- The code is modular and can be extended for new tokens, sources, or blockchains.
-- For live trading, use testnet credentials and small amounts first.
-
----
-
-## 📣 Run the Dashboard
-
-```sh
-streamlit run bnb_arb_agent/dashboard.py
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
----
+### 2. Configure environment variables
 
-## 📧 Contact & Issues
-- For bugs or feature requests, open an issue on the project repository.
-- For help with MCP integration, see the official BNB Chain MCP documentation.
+```bash
+cp bnb_arb_agent/env.example .env
+```
+
+Fill in `.env`:
+
+```env
+# Required
+GOOGLE_API_KEY=your_gemini_api_key
+PRIVATE_KEY=your_64_char_hex_private_key     # BSC Testnet only — never use mainnet key
+WALLET_ADDRESS=0xYourWalletAddress            # Must match PRIVATE_KEY
+MCP_SERVER_URL=http://localhost:3001
+
+# Execution settings
+EXECUTION_ENABLED=true
+TRADE_AMOUNT_BNB=0.01
+MIN_PROFIT_THRESHOLD=0.005
+SLIPPAGE_TOLERANCE=0.02
+CIRCUIT_BREAKER_MAX_FAILURES=3
+CIRCUIT_BREAKER_COOLDOWN_MIN=15
+
+# Optional — improves data quality
+GNEWS_KEY=...
+CRYPTOPANIC_KEY=...
+BSCSCAN_API_KEY=...
+GITHUB_TOKEN=...
+```
+
+## Running
+
+You need **two terminals**.
+
+### Terminal 1 — BNBChain MCP server
+
+```powershell
+.\start_mcp.ps1
+```
+
+Wait for `INFO: Starting sse server on port 3001` before starting the agent.
+
+> If port 3001 is already in use:
+> ```powershell
+> Get-NetTCPConnection -LocalPort 3001 | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force }
+> .\start_mcp.ps1
+> ```
+
+### Terminal 2 — Agent
+
+```powershell
+.venv\Scripts\python.exe bnb_arb_agent\orchestrator.py
+```
+
+### Optional — Streamlit Dashboard
+
+```powershell
+.venv\Scripts\python.exe -m streamlit run bnb_arb_agent\dashboard.py
+```
+
+Open http://localhost:8501
+
+## Tests
+
+```powershell
+.venv\Scripts\python.exe -m pytest bnb_arb_agent\tests\ -v
+```
+
+20 unit tests covering decision logic and DEX price fallback chain.
+
+## Make Shortcuts
+
+```
+make run        # Run the orchestrator
+make test       # Run pytest
+make dashboard  # Launch Streamlit dashboard
+make mcp        # Start the MCP server
+```

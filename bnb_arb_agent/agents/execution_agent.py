@@ -1,540 +1,314 @@
-# agents/execution_agent.py
-# 🚀 Execution Agent — Routes trades through bnbchain-mcp server
-# Handles: Pre-flight checks, swap execution (buy + sell), circuit breaker, post-trade logging
+"""Trade execution agent — routes swap orders through the bnbchain-mcp server."""
 
-import os
+import asyncio
 import json
+import os
+import re
 import time
-import requests
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
-from config import Config
 
-cfg = Config()
+import requests
+
+from core.constants import (
+    BSC_TESTNET_CHAIN_ID,
+    PANCAKE_V2_ROUTER_TESTNET,
+    SWAP_ABI_JSON,
+    ROUTER_ABI_JSON,
+    TESTNET_TOKENS,
+)
+from core.exceptions import MCPError
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
+_TX_HASH_PATTERN = re.compile(r"(0x[a-fA-F0-9]{64})")
 
 
-# ═══════════════════════════════════════════════════════════════
-# MCP CLIENT — Talks to the bnbchain-mcp server via SSE (MCP SDK)
-# ═══════════════════════════════════════════════════════════════
 class MCPClient:
-    """SSE-based MCP client using the official mcp Python SDK."""
+    """Async MCP client over SSE transport.
 
-    def __init__(self, base_url: str = None):
-        self.base_url = (base_url or os.getenv("MCP_SERVER_URL", "http://localhost:3001")).rstrip("/")
-        self.sse_url = f"{self.base_url}/sse"
-        self._tools_cache = None
+    Each call opens a new SSE session. This avoids shared-state issues when
+    the client is used from synchronous contexts via asyncio.run().
+    """
 
-    def _run_async(self, coro):
-        """Run an async coroutine synchronously (from sync context)."""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError
-            return loop.run_until_complete(coro)
-        except RuntimeError:
-            return asyncio.run(coro)
-
-    def discover_tools(self) -> list:
-        """Fetch available tools from the MCP server."""
-        async def _do():
-            try:
-                from mcp.client.sse import sse_client
-                from mcp import ClientSession
-                async with sse_client(self.sse_url) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        result = await session.list_tools()
-                        self._tools_cache = [t.model_dump() for t in result.tools]
-                        return self._tools_cache
-            except Exception as e:
-                print(f"  ❌ MCP tool discovery failed: {e}")
-                return []
-        return self._run_async(_do())
-
-    def call_tool(self, tool_name: str, arguments: dict, timeout: int = 30) -> dict:
-        """Invoke an MCP tool by name with arguments via SSE."""
-        async def _do():
-            try:
-                from mcp.client.sse import sse_client
-                from mcp import ClientSession
-                async with sse_client(self.sse_url) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        result = await session.call_tool(tool_name, arguments)
-                        # Extract text content from response
-                        content = result.content
-                        if content and hasattr(content[0], "text"):
-                            return {"result": content[0].text, "content": [c.model_dump() for c in content]}
-                        return {"result": str(content)}
-            except Exception as e:
-                return {"error": str(e)}
-        return self._run_async(_do())
+    def __init__(self, base_url: str) -> None:
+        self._sse_url = base_url.rstrip("/") + "/sse"
 
     def is_alive(self) -> bool:
-        """Quick health check — ping the SSE endpoint."""
         try:
-            resp = requests.get(self.sse_url, timeout=5, stream=True)
-            return resp.status_code == 200
-        except:
+            response = requests.get(self._sse_url, timeout=5, stream=True)
+            return response.status_code == 200
+        except requests.RequestException:
             return False
 
+    def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        """Invoke an MCP tool and return the response dict."""
+        return asyncio.run(self._call_tool_async(tool_name, arguments))
 
-# ═══════════════════════════════════════════════════════════════
-# TRADE LOGGER — Persistent post-trade logging for hackathon demo
-# ═══════════════════════════════════════════════════════════════
-class TradeLogger:
-    """Logs every trade attempt with full context for demo/audit."""
-
-    LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "trade_log.json")
-
-    def __init__(self):
-        self.logs = []
-        self._load_existing()
-
-    def _load_existing(self):
+    async def _call_tool_async(self, tool_name: str, arguments: dict) -> dict:
         try:
-            if os.path.exists(self.LOG_FILE):
-                with open(self.LOG_FILE, "r") as f:
-                    self.logs = json.load(f)
-        except:
-            self.logs = []
+            from mcp import ClientSession
+            from mcp.client.sse import sse_client
 
-    def log(self, entry: dict):
-        """Append a trade log entry and persist to disk."""
-        entry["logged_at"] = datetime.utcnow().isoformat()
-        self.logs.append(entry)
-        self._persist()
-        self._print_log(entry)
-
-    def _persist(self):
-        try:
-            with open(self.LOG_FILE, "w") as f:
-                json.dump(self.logs, f, indent=2, default=str)
-        except Exception as e:
-            print(f"  ⚠️  Could not persist trade log: {e}")
-
-    def _print_log(self, entry: dict):
-        status = entry.get("status", "UNKNOWN")
-        icon = "✅" if status == "SUCCESS" else "❌" if status == "FAILED" else "⏭️"
-        print(f"""
-  ┌─ TRADE LOG ────────────────────────────────────────
-  │  {icon} Status:     {status}
-  │  Token In:     {entry.get('token_in', '?')} → Token Out: {entry.get('token_out', '?')}
-  │  Amount:       {entry.get('amount', '?')}
-  │  Direction:    {entry.get('direction', '?')}
-  │  TX Hash:      {entry.get('tx_hash', 'N/A')}
-  │  Profit Est:   {entry.get('profit_estimate_pct', '?')}%
-  │  Phase:        {entry.get('market_phase', '?')}
-  │  Sentiment:    {entry.get('sentiment_signal', '?')}
-  │  Confidence:   {entry.get('confidence_score', '?')}/100
-  │  Timestamp:    {entry.get('logged_at', '?')}
-  │  Reason:       {entry.get('reason', '')}
-  └────────────────────────────────────────────────────
-""")
-
-    def get_recent(self, n: int = 10) -> list:
-        return self.logs[-n:]
+            async with sse_client(self._sse_url) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool_name, arguments)
+                    content = result.content
+                    if content and hasattr(content[0], "text"):
+                        return {"result": content[0].text, "content": [c.model_dump() for c in content]}
+                    return {"result": str(content)}
+        except Exception as exc:
+            return {"error": str(exc)}
 
 
-# ═══════════════════════════════════════════════════════════════
-# CIRCUIT BREAKER — Pauses execution after consecutive failures
-# ═══════════════════════════════════════════════════════════════
 class CircuitBreaker:
-    """If N consecutive trades fail, pause execution and alert."""
+    """Pauses trade execution after a configurable number of consecutive failures."""
 
-    def __init__(self, max_failures: int = 3, cooldown_minutes: int = 15):
-        self.max_failures = max_failures
-        self.cooldown_minutes = cooldown_minutes
-        self.consecutive_failures = 0
-        self.is_open = False  # True = circuit is tripped, no more trades
-        self.tripped_at: Optional[datetime] = None
+    def __init__(self, max_failures: int = 3, cooldown_minutes: int = 15) -> None:
+        self._max_failures      = max_failures
+        self._cooldown          = timedelta(minutes=cooldown_minutes)
+        self._failures          = 0
+        self._is_open           = False
+        self._tripped_at: Optional[datetime] = None
 
-    def record_success(self):
-        self.consecutive_failures = 0
-        self.is_open = False
-        self.tripped_at = None
+    def record_success(self) -> None:
+        self._failures  = 0
+        self._is_open   = False
+        self._tripped_at = None
 
-    def record_failure(self):
-        self.consecutive_failures += 1
-        if self.consecutive_failures >= self.max_failures:
-            self.is_open = True
-            self.tripped_at = datetime.utcnow()
-            print(f"""
-  🚨🚨🚨 CIRCUIT BREAKER TRIPPED 🚨🚨🚨
-  {self.consecutive_failures} consecutive trade failures!
-  Execution paused for {self.cooldown_minutes} minutes.
-  Tripped at: {self.tripped_at.isoformat()}
-""")
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= self._max_failures:
+            self._is_open   = True
+            self._tripped_at = datetime.utcnow()
+            logger.error("Circuit breaker tripped after %d failures.", self._failures)
 
     def allow_trade(self) -> bool:
-        if not self.is_open:
+        if not self._is_open:
             return True
-        # Check if cooldown has elapsed
-        if self.tripped_at and datetime.utcnow() > self.tripped_at + timedelta(minutes=self.cooldown_minutes):
-            print("  🔄 Circuit breaker cooldown elapsed — resetting.")
-            self.is_open = False
-            self.consecutive_failures = 0
-            self.tripped_at = None
+        if self._tripped_at and datetime.utcnow() > self._tripped_at + self._cooldown:
+            logger.info("Circuit breaker cooldown elapsed — resetting.")
+            self._is_open    = False
+            self._failures   = 0
+            self._tripped_at = None
             return True
-        remaining = (self.tripped_at + timedelta(minutes=self.cooldown_minutes) - datetime.utcnow()).seconds // 60
-        print(f"  ⛔ Circuit breaker OPEN — {remaining} min remaining in cooldown.")
+        remaining = int((self._tripped_at + self._cooldown - datetime.utcnow()).seconds / 60)
+        logger.warning("Circuit breaker open — %d min remaining in cooldown.", remaining)
         return False
 
     @property
     def status(self) -> dict:
         return {
-            "is_open": self.is_open,
-            "consecutive_failures": self.consecutive_failures,
-            "max_failures": self.max_failures,
-            "tripped_at": self.tripped_at.isoformat() if self.tripped_at else None,
+            "is_open":            self._is_open,
+            "consecutive_failures": self._failures,
+            "tripped_at":         self._tripped_at.isoformat() if self._tripped_at else None,
         }
 
 
-# ═══════════════════════════════════════════════════════════════
-# 🚀 EXECUTION AGENT — Master trade execution coordinator
-# ═══════════════════════════════════════════════════════════════
+class TradeLogger:
+    """Persists trade attempts to a JSON file for audit and hackathon demo purposes."""
 
-# Testnet constants
-BSC_TESTNET_CHAIN_ID = 97
-PANCAKE_ROUTER_TESTNET = "0xD99D1c33F9fC3444f8101754aBC46c52416550D1"
-WBNB_TESTNET = "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd"
+    _LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "trade_log.json")
 
-# Common testnet token addresses (BSC Testnet)
-TESTNET_TOKENS = {
-    "BNB":  WBNB_TESTNET,
-    "WBNB": WBNB_TESTNET,
-    "BUSD": "0xeD24FC36d5Ee211Ea25A80239Fb8C4Cfd80f12Ee",
-    "USDT": "0x337610d27c682E347C9cD60BD4b3b107C9d34dDd",
-    "DAI":  "0x8a9424745056Eb399FD19a0EC26A14316684e274",
-    "CAKE": "0xFa60D973F7642B748046464e165A65B7323b0DEE",
-}
+    def __init__(self) -> None:
+        self._records: list[dict] = []
+        self._load()
 
-# PancakeSwap Router ABI fragments we need
-SWAP_EXACT_TOKENS_FOR_TOKENS_ABI = json.dumps([{
-    "inputs": [
-        {"name": "amountIn", "type": "uint256"},
-        {"name": "amountOutMin", "type": "uint256"},
-        {"name": "path", "type": "address[]"},
-        {"name": "to", "type": "address"},
-        {"name": "deadline", "type": "uint256"},
-    ],
-    "name": "swapExactTokensForTokens",
-    "outputs": [{"name": "amounts", "type": "uint256[]"}],
-    "stateMutability": "nonpayable",
-    "type": "function",
-}])
+    def _load(self) -> None:
+        try:
+            if os.path.exists(self._LOG_FILE):
+                with open(self._LOG_FILE) as fh:
+                    self._records = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            self._records = []
 
-GET_AMOUNTS_OUT_ABI = json.dumps([{
-    "inputs": [
-        {"name": "amountIn", "type": "uint256"},
-        {"name": "path", "type": "address[]"},
-    ],
-    "name": "getAmountsOut",
-    "outputs": [{"name": "amounts", "type": "uint256[]"}],
-    "stateMutability": "view",
-    "type": "function",
-}])
+    def log(self, entry: dict) -> None:
+        entry["logged_at"] = datetime.utcnow().isoformat()
+        self._records.append(entry)
+        try:
+            with open(self._LOG_FILE, "w") as fh:
+                json.dump(self._records, fh, indent=2, default=str)
+        except OSError:
+            logger.warning("Could not persist trade log.")
+        logger.info(
+            "Trade logged: %s | status=%s | tx=%s",
+            entry.get("direction"),
+            entry.get("status"),
+            entry.get("tx_hash", "N/A"),
+        )
+
+    def recent(self, count: int = 10) -> list[dict]:
+        return self._records[-count:]
 
 
 class ExecutionAgent:
-    """
-    Coordinates trade execution through the bnbchain-mcp server.
-    
+    """Executes arbitrage swaps on BSC Testnet via the bnbchain-mcp server.
+
     Flow:
-      1. Pre-flight checks (chain alive, balance sufficient, simulate swap)
-      2. Execute buy-side swap via MCP write_contract
-      3. Execute sell-side swap via MCP write_contract
-      4. Log results with full context
-      5. Circuit breaker on consecutive failures
+        1. Circuit breaker check
+        2. Pre-flight (chain liveness, balance, swap simulation)
+        3. Buy-side swap (spend stablecoin, acquire token)
+        4. Sell-side swap (dispose of token)
+        5. log result
     """
 
-    def __init__(self, mcp_url: str = None):
-        self.mcp = MCPClient(mcp_url)
-        self.logger = TradeLogger()
-        self.breaker = CircuitBreaker(
-            max_failures=int(os.getenv("CIRCUIT_BREAKER_MAX_FAILURES", "3")),
-            cooldown_minutes=int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_MIN", "15")),
+    def __init__(self, mcp_url: str = None) -> None:
+        url = mcp_url or os.getenv("MCP_SERVER_URL", "http://localhost:3001")
+        self._mcp            = MCPClient(url)
+        self._logger         = TradeLogger()
+        self._breaker        = CircuitBreaker(
+            max_failures    = int(os.getenv("CIRCUIT_BREAKER_MAX_FAILURES", "3")),
+            cooldown_minutes = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_MIN", "15")),
         )
-        self.wallet_address = os.getenv("WALLET_ADDRESS", "")
-        self.default_amount_bnb = float(os.getenv("TRADE_AMOUNT_BNB", "0.01"))
-        self.min_profit_threshold = float(os.getenv("MIN_PROFIT_THRESHOLD", "0.005"))  # 0.5%
+        self._wallet         = os.getenv("WALLET_ADDRESS", "")
+        self._amount_bnb     = float(os.getenv("TRADE_AMOUNT_BNB", "0.01"))
+        self._min_profit     = float(os.getenv("MIN_PROFIT_THRESHOLD", "0.005"))
 
-    # ───────────────────────────────────────────────────────
-    #  PUBLIC: Execute a trade from a decision result
-    # ───────────────────────────────────────────────────────
     def execute(self, decision: dict) -> dict:
-        """
-        Main entry point. Called by the decision agent when action == EXECUTE_TRADE.
-        
-        Args:
-            decision: dict with keys: token, direction, cex_price, dex_price,
-                      price_diff_pct, sentiment_signal, market_phase,
-                      confidence_score, risk_level, reason
-        Returns:
-            dict with execution result (status, tx_hash, profit, etc.)
-        """
-        token = decision.get("token", "BNB")
-        direction = decision.get("direction", "BUY_DEX_SELL_CEX")
-        price_diff_pct = decision.get("price_diff_pct", 0)
-        confidence = decision.get("confidence_score", 0)
-        phase = decision.get("market_phase", "UNKNOWN")
-        sentiment = decision.get("sentiment_signal", 0)
+        """Execute a trade based on *decision*, returning a result dict."""
+        token      = decision.get("token", "BNB")
+        direction  = decision.get("direction", "BUY_DEX_SELL_CEX")
+        price_diff = decision.get("price_diff_pct", 0.0)
 
-        print(f"\n  🚀 EXECUTION AGENT — Attempting trade for {token}")
-        print(f"     Direction: {direction} | Confidence: {confidence}/100")
+        if not self._breaker.allow_trade():
+            return self._build_result(token, direction, "BLOCKED_CIRCUIT_BREAKER",
+                                      "Circuit breaker is open.", decision)
 
-        # ── Circuit breaker check ──
-        if not self.breaker.allow_trade():
-            result = self._build_result(
-                token=token, direction=direction,
-                status="BLOCKED_CIRCUIT_BREAKER",
-                reason="Circuit breaker is open — too many consecutive failures",
-                decision=decision,
-            )
-            self.logger.log(result)
-            return result
-
-        # ── Pre-flight checks ──
-        preflight = self._preflight_checks(token, direction, price_diff_pct)
+        preflight = self._preflight(token, direction, price_diff)
         if not preflight["passed"]:
-            result = self._build_result(
-                token=token, direction=direction,
-                status="PREFLIGHT_FAILED",
-                reason=preflight["reason"],
-                decision=decision,
-            )
-            self.logger.log(result)
-            self.breaker.record_failure()
+            result = self._build_result(token, direction, "PREFLIGHT_FAILED", preflight["reason"], decision)
+            self._logger.log(result)
+            self._breaker.record_failure()
             return result
 
-        # ── Determine swap parameters ──
-        token_in, token_out = self._resolve_swap_pair(token, direction)
-        amount_in_wei = self._to_wei(self.default_amount_bnb)
+        token_in, token_out = self._swap_pair(token, direction)
+        amount_wei          = self._to_wei(self._amount_bnb)
 
-        # ── Execute Buy Side (DEX swap) ──
-        print(f"  📈 Executing buy side: {token_in} → {token_out}")
-        buy_result = self._execute_swap(token_in, token_out, amount_in_wei)
-
-        if buy_result.get("error"):
-            result = self._build_result(
-                token=token, direction=direction,
-                status="FAILED",
-                reason=f"Buy-side swap failed: {buy_result['error']}",
-                decision=decision,
-            )
-            self.logger.log(result)
-            self.breaker.record_failure()
+        buy = self._swap(token_in, token_out, amount_wei)
+        if buy.get("error"):
+            result = self._build_result(token, direction, "FAILED",
+                                        f"Buy-side failed: {buy['error']}", decision)
+            self._logger.log(result)
+            self._breaker.record_failure()
             return result
 
-        buy_tx_hash = buy_result.get("tx_hash", "unknown")
-        print(f"  ✅ Buy TX: {buy_tx_hash}")
-
-        # ── Execute Sell Side (reverse swap) ──
-        # For CEX sell, we'd use a CEX API. For DEX-DEX arb, do the reverse swap.
-        print(f"  📉 Executing sell side: {token_out} → {token_in}")
-        sell_result = self._execute_swap(token_out, token_in, buy_result.get("amount_out_wei", amount_in_wei))
-
-        if sell_result.get("error"):
-            # Buy succeeded but sell failed — partial execution
-            result = self._build_result(
-                token=token, direction=direction,
-                status="PARTIAL",
-                tx_hash=buy_tx_hash,
-                reason=f"Sell-side swap failed: {sell_result['error']}. Buy TX succeeded.",
-                decision=decision,
-            )
-            self.logger.log(result)
-            self.breaker.record_failure()
+        sell = self._swap(token_out, token_in, buy.get("amount_out_wei", amount_wei))
+        if sell.get("error"):
+            result = self._build_result(token, direction, "PARTIAL",
+                                        f"Sell-side failed: {sell['error']}",
+                                        decision, tx_hash=buy.get("tx_hash"))
+            self._logger.log(result)
+            self._breaker.record_failure()
             return result
 
-        sell_tx_hash = sell_result.get("tx_hash", "unknown")
-        print(f"  ✅ Sell TX: {sell_tx_hash}")
-
-        # ── Success! ──
         result = self._build_result(
-            token=token, direction=direction,
-            status="SUCCESS",
-            tx_hash=f"BUY:{buy_tx_hash} | SELL:{sell_tx_hash}",
-            profit_estimate_pct=price_diff_pct,
-            decision=decision,
+            token, direction, "SUCCESS", "",
+            decision,
+            tx_hash=f"BUY:{buy['tx_hash']} SELL:{sell['tx_hash']}",
+            profit_pct=price_diff,
         )
-        self.logger.log(result)
-        self.breaker.record_success()
+        self._logger.log(result)
+        self._breaker.record_success()
         return result
 
-    # ───────────────────────────────────────────────────────
-    #  PRE-FLIGHT CHECKS
-    # ───────────────────────────────────────────────────────
-    def _preflight_checks(self, token: str, direction: str, price_diff_pct: float) -> dict:
-        """
-        Run all pre-flight checks before executing:
-          1. Chain is live (get_block_by_number)
-          2. Wallet has sufficient balance (get_token_balance)
-          3. Simulate swap to confirm profit is still valid (getAmountsOut)
-        """
-        print("  🔍 Running pre-flight checks...")
+    def _preflight(self, token: str, direction: str, price_diff: float) -> dict:
+        block = self._mcp.call_tool("get_block_by_number", {"blockNumber": "latest", "network": "bsc-testnet"})
+        if block.get("error"):
+            return {"passed": False, "reason": f"Chain check failed: {block['error']}"}
 
-        # ── Check 1: Chain liveness ──
-        print("     [1/3] Checking chain liveness...")
-        block_result = self.mcp.call_tool("get_block_by_number", {
-            "blockNumber": "latest",
-            "network": "bsc-testnet",
-        })
-        if block_result.get("error"):
-            return {"passed": False, "reason": f"Chain liveness check failed: {block_result['error']}"}
+        self._mcp.call_tool("get_token_balance", {"address": self._wallet, "network": "bsc-testnet"})
 
-        # Extract block info for logging
-        block_data = block_result.get("result", block_result)
-        print(f"     ✅ Chain is live — latest block received")
-
-        # ── Check 2: Wallet balance ──
-        print("     [2/3] Checking wallet balance...")
-        balance_result = self.mcp.call_tool("get_token_balance", {
-            "address": self.wallet_address,
-            "network": "bsc-testnet",
-        })
-        if balance_result.get("error"):
-            # Non-fatal: we'll try the trade anyway, but warn
-            print(f"     ⚠️  Balance check warning: {balance_result['error']}")
-        else:
-            balance_data = balance_result.get("result", balance_result)
-            print(f"     ✅ Balance check passed")
-
-        # ── Check 3: Simulate swap (getAmountsOut) ──
-        print("     [3/3] Simulating swap to confirm profitability...")
-        token_in_addr, token_out_addr = self._resolve_swap_pair(token, direction)
-        amount_in_wei = self._to_wei(self.default_amount_bnb)
-
-        sim_result = self.mcp.call_tool("read_contract", {
-            "contractAddress": PANCAKE_ROUTER_TESTNET,
-            "abi": GET_AMOUNTS_OUT_ABI,
-            "functionName": "getAmountsOut",
-            "args": json.dumps([str(amount_in_wei), [token_in_addr, token_out_addr]]),
-            "network": "bsc-testnet",
+        token_in, token_out = self._swap_pair(token, direction)
+        self._mcp.call_tool("read_contract", {
+            "contractAddress": PANCAKE_V2_ROUTER_TESTNET,
+            "abi":             ROUTER_ABI_JSON,
+            "functionName":    "getAmountsOut",
+            "args":            json.dumps([str(self._to_wei(self._amount_bnb)), [token_in, token_out]]),
+            "network":         "bsc-testnet",
         })
 
-        if sim_result.get("error"):
-            print(f"     ⚠️  Swap simulation warning: {sim_result['error']}")
-            # Non-fatal — price slippage may have changed, but we proceed with caution
-        else:
-            sim_data = sim_result.get("result", sim_result)
-            print(f"     ✅ Swap simulation passed — profit still appears valid")
+        if price_diff < self._min_profit * 100:
+            return {"passed": False, "reason": f"Profit {price_diff:.3f}% below minimum {self._min_profit * 100:.1f}%"}
 
-        # ── Check profit threshold ──
-        if price_diff_pct < self.min_profit_threshold * 100:
-            return {
-                "passed": False,
-                "reason": f"Profit {price_diff_pct:.3f}% below minimum threshold {self.min_profit_threshold * 100:.1f}%",
-            }
+        return {"passed": True, "reason": ""}
 
-        print("  ✅ All pre-flight checks passed!")
-        return {"passed": True, "reason": "All checks passed"}
-
-    # ───────────────────────────────────────────────────────
-    #  SWAP EXECUTION via MCP write_contract
-    # ───────────────────────────────────────────────────────
-    def _execute_swap(self, token_in: str, token_out: str, amount_in_wei: int) -> dict:
-        """
-        Execute a PancakeSwap swap through the MCP server's write_contract tool.
-        Uses swapExactTokensForTokens on the PancakeSwap testnet router.
-        """
-        # 2% slippage tolerance
-        amount_out_min = int(amount_in_wei * 0.98)
-        # Deadline: 5 minutes from now
-        deadline = int(time.time()) + 300
-
-        swap_args = json.dumps([
-            str(amount_in_wei),           # amountIn
-            str(amount_out_min),          # amountOutMin (2% slippage)
-            [token_in, token_out],        # path
-            self.wallet_address,          # to
-            str(deadline),                # deadline
+    def _swap(self, token_in: str, token_out: str, amount_wei: int) -> dict:
+        args = json.dumps([
+            str(amount_wei),
+            str(int(amount_wei * 0.98)),  # 2% slippage
+            [token_in, token_out],
+            self._wallet,
+            str(int(time.time()) + 300),  # 5-minute deadline
         ])
-
-        result = self.mcp.call_tool("write_contract", {
-            "contractAddress": PANCAKE_ROUTER_TESTNET,
-            "abi": SWAP_EXACT_TOKENS_FOR_TOKENS_ABI,
-            "functionName": "swapExactTokensForTokens",
-            "args": swap_args,
-            "network": "bsc-testnet",
-        }, timeout=60)
-
+        result = self._mcp.call_tool("write_contract", {
+            "contractAddress": PANCAKE_V2_ROUTER_TESTNET,
+            "abi":             SWAP_ABI_JSON,
+            "functionName":    "swapExactTokensForTokens",
+            "args":            args,
+            "network":         "bsc-testnet",
+        })
         if result.get("error"):
             return {"error": result["error"]}
 
-        # Parse MCP response for tx hash
-        tx_hash = "unknown"
-        amount_out_wei = amount_in_wei  # fallback
+        tx_hash = result.get("transactionHash", result.get("hash", "unknown"))
+        content = result.get("content", [])
+        if not tx_hash or tx_hash == "unknown":
+            for item in content:
+                text = item.get("text", "") if isinstance(item, dict) else str(item)
+                match = _TX_HASH_PATTERN.search(text)
+                if match:
+                    tx_hash = match.group(1)
+                    break
 
-        if isinstance(result, dict):
-            # The MCP server typically returns: { "content": [{ "text": "..." }] }
-            content = result.get("content", [])
-            if isinstance(content, list) and content:
-                text = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
-                # Try to extract tx hash from response
-                if "0x" in text:
-                    # Find the transaction hash (66 characters: 0x + 64 hex)
-                    import re
-                    hash_match = re.search(r"(0x[a-fA-F0-9]{64})", text)
-                    if hash_match:
-                        tx_hash = hash_match.group(1)
-            # Also check for direct result field
-            tx_hash = result.get("transactionHash", result.get("hash", tx_hash))
+        return {"tx_hash": tx_hash, "amount_out_wei": amount_wei}
 
-        return {"tx_hash": tx_hash, "amount_out_wei": amount_out_wei}
-
-    # ───────────────────────────────────────────────────────
-    #  HELPERS
-    # ───────────────────────────────────────────────────────
-    def _resolve_swap_pair(self, token: str, direction: str):
-        """
-        Resolve token symbols to testnet contract addresses for the swap pair.
-        Returns (token_in_address, token_out_address).
-        """
+    def _swap_pair(self, token: str, direction: str) -> tuple[str, str]:
+        stable = TESTNET_TOKENS.get("BUSD", TESTNET_TOKENS["BNB"])
+        token_addr = TESTNET_TOKENS.get(token, TESTNET_TOKENS["BNB"])
         if direction == "BUY_DEX_SELL_CEX":
-            # Buy on DEX: spend stablecoin → get token
-            token_in = TESTNET_TOKENS.get("BUSD", TESTNET_TOKENS["WBNB"])
-            token_out = TESTNET_TOKENS.get(token, TESTNET_TOKENS["WBNB"])
-        else:
-            # BUY_CEX_SELL_DEX: sell token on DEX → get stablecoin
-            token_in = TESTNET_TOKENS.get(token, TESTNET_TOKENS["WBNB"])
-            token_out = TESTNET_TOKENS.get("BUSD", TESTNET_TOKENS["WBNB"])
+            return stable, token_addr
+        return token_addr, stable
 
-        return token_in, token_out
+    @staticmethod
+    def _to_wei(amount: float, decimals: int = 18) -> int:
+        return int(amount * (10 ** decimals))
 
-    def _to_wei(self, amount_bnb: float, decimals: int = 18) -> int:
-        """Convert human-readable amount to wei."""
-        return int(amount_bnb * (10 ** decimals))
-
-    def _build_result(self, token: str, direction: str, status: str,
-                      reason: str = "", tx_hash: str = "N/A",
-                      profit_estimate_pct: float = 0, decision: dict = None) -> dict:
-        """Build a standardized trade result dict for logging."""
-        decision = decision or {}
+    def _build_result(
+        self,
+        token:      str,
+        direction:  str,
+        status:     str,
+        reason:     str,
+        decision:   dict,
+        tx_hash:    str = "N/A",
+        profit_pct: float = 0.0,
+    ) -> dict:
         return {
-            "token_in": token if direction == "BUY_CEX_SELL_DEX" else "BUSD",
-            "token_out": "BUSD" if direction == "BUY_CEX_SELL_DEX" else token,
-            "amount": self.default_amount_bnb,
-            "direction": direction,
-            "status": status,
-            "tx_hash": tx_hash,
-            "profit_estimate_pct": round(profit_estimate_pct, 4),
-            "market_phase": decision.get("market_phase", "UNKNOWN"),
-            "sentiment_signal": decision.get("sentiment_signal", 0),
-            "confidence_score": decision.get("confidence_score", 0),
-            "risk_level": decision.get("risk_level", "UNKNOWN"),
-            "reason": reason or decision.get("reason", ""),
-            "chain_id": BSC_TESTNET_CHAIN_ID,
-            "router": PANCAKE_ROUTER_TESTNET,
-            "timestamp": datetime.utcnow().isoformat(),
-            "circuit_breaker": self.breaker.status,
+            "token_in":             token if direction == "BUY_CEX_SELL_DEX" else "BUSD",
+            "token_out":            "BUSD" if direction == "BUY_CEX_SELL_DEX" else token,
+            "amount":               self._amount_bnb,
+            "direction":            direction,
+            "status":               status,
+            "tx_hash":              tx_hash,
+            "profit_estimate_pct":  round(profit_pct, 4),
+            "market_phase":         decision.get("market_phase", "UNKNOWN"),
+            "sentiment_signal":     decision.get("sentiment_signal", 0.0),
+            "confidence_score":     decision.get("confidence_score", 0),
+            "risk_level":           decision.get("risk_level", "UNKNOWN"),
+            "reason":               reason or decision.get("reason", ""),
+            "chain_id":             BSC_TESTNET_CHAIN_ID,
+            "router":               PANCAKE_V2_ROUTER_TESTNET,
+            "timestamp":            datetime.utcnow().isoformat(),
+            "circuit_breaker":      self._breaker.status,
         }
 
     @property
-    def trade_history(self) -> list:
-        return self.logger.get_recent(50)
+    def trade_history(self) -> list[dict]:
+        return self._logger.recent(50)
 
     @property
     def circuit_breaker_status(self) -> dict:
-        return self.breaker.status
+        return self._breaker.status

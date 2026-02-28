@@ -1,59 +1,87 @@
-# config.py — Single merged Config with all settings
+"""Agent configuration loaded from environment variables."""
+
 import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+from core.exceptions import ConfigurationError
+from core.logger import get_logger
 
+logger = get_logger(__name__)
+
+# Walk up from this file's location to find the .env file, supporting both
+# running from the project root and from within the bnb_arb_agent subdirectory.
+_env_path = Path(__file__).parent
+for _ in range(3):
+    candidate = _env_path / ".env"
+    if candidate.exists():
+        load_dotenv(candidate, override=False)
+        break
+    _env_path = _env_path.parent
+
+
+def _require(key: str) -> str:
+    value = os.getenv(key, "")
+    if not value:
+        raise ConfigurationError(f"Required environment variable '{key}' is not set.")
+    return value
+
+
+def _optional(key: str, default: str = "") -> str:
+    return os.getenv(key, default)
+
+
+@dataclass
 class Config:
-    # ── Reddit ──
-    REDDIT_CLIENT_ID  = os.getenv("REDDIT_CLIENT_ID", "")
-    REDDIT_SECRET     = os.getenv("REDDIT_SECRET", "")
-    REDDIT_USER_AGENT = "BNBArb/1.0"
+    # Authentication
+    google_api_key: str        = field(default_factory=lambda: _require("GOOGLE_API_KEY"))
 
-    # ── News APIs ──
-    NEWSAPI_KEY      = os.getenv("NEWSAPI_KEY", "")
-    GNEWS_KEY        = os.getenv("GNEWS_KEY", "")
-    THENEWSAPI_KEY   = os.getenv("THENEWSAPI_KEY", "")
+    gnews_key: str             = field(default_factory=lambda: _optional("GNEWS_KEY"))
+    thenewsapi_key: str        = field(default_factory=lambda: _optional("THENEWSAPI_KEY"))
+    cryptopanic_key: str       = field(default_factory=lambda: _optional("CRYPTOPANIC_KEY"))
+    newsapi_key: str           = field(default_factory=lambda: _optional("NEWSAPI_KEY"))
+    twitter_bearer_token: str  = field(default_factory=lambda: _optional("TWITTER_BEARER_TOKEN"))
+    bscscan_api_key: str       = field(default_factory=lambda: _optional("BSCSCAN_API_KEY"))
+    github_token: str          = field(default_factory=lambda: _optional("GITHUB_TOKEN"))
 
-    # CryptoPanic
-    CRYPTOPANIC_KEY  = os.getenv("CRYPTOPANIC_KEY", "")
+    # Wallet
+    private_key: str           = field(default_factory=lambda: _optional("PRIVATE_KEY"))
+    wallet_address: str        = field(default_factory=lambda: _optional("WALLET_ADDRESS"))
 
-    # ── Twitter ──
-    TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "")
+    # MCP server
+    mcp_server_url: str        = field(default_factory=lambda: _optional("MCP_SERVER_URL", "http://localhost:3001"))
 
-    # ── Gemini ──
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+    # Trade execution
+    trade_amount_bnb: float    = field(default_factory=lambda: float(_optional("TRADE_AMOUNT_BNB", "0.01")))
+    min_profit_threshold: float = field(default_factory=lambda: float(_optional("MIN_PROFIT_THRESHOLD", "0.005")))
+    slippage_tolerance: float  = field(default_factory=lambda: float(_optional("SLIPPAGE_TOLERANCE", "0.02")))
+    execution_enabled: bool    = field(default_factory=lambda: _optional("EXECUTION_ENABLED", "true").lower() == "true")
 
-    # ── On-Chain APIs ──
-    BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-    PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+    # Circuit breaker
+    circuit_breaker_max_failures: int  = field(default_factory=lambda: int(_optional("CIRCUIT_BREAKER_MAX_FAILURES", "3")))
+    circuit_breaker_cooldown_min: int  = field(default_factory=lambda: int(_optional("CIRCUIT_BREAKER_COOLDOWN_MIN", "15")))
 
-    # ── MCP Server (bnbchain-mcp) ──
-    MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:3000")
-    WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")
-
-    # ── Execution Settings ──
-    TRADE_AMOUNT_BNB = float(os.getenv("TRADE_AMOUNT_BNB", "0.01"))
-    MIN_PROFIT_THRESHOLD = float(os.getenv("MIN_PROFIT_THRESHOLD", "0.005"))  # 0.5%
-    SLIPPAGE_TOLERANCE = float(os.getenv("SLIPPAGE_TOLERANCE", "0.02"))  # 2%
-    EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "true").lower() == "true"
-
-    # ── Circuit Breaker ──
-    CIRCUIT_BREAKER_MAX_FAILURES = int(os.getenv("CIRCUIT_BREAKER_MAX_FAILURES", "3"))
-    CIRCUIT_BREAKER_COOLDOWN_MIN = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_MIN", "15"))
-
-    # ── Tokens to track ──
-    TARGET_TOKENS = ["BNB", "CAKE", "BTCB", "ETH"]
-
-    SEARCH_KEYWORDS = [
+    # Agent behaviour
+    target_tokens: list = field(default_factory=lambda: ["BNB", "CAKE", "BTCB", "ETH"])
+    search_keywords: list = field(default_factory=lambda: [
         "BNB price", "BNB pump", "BNB chain",
         "pancakeswap CAKE token",
         "BNB arbitrage", "pancakeswap arbitrage",
-        "BNB listing", "BNB bullish"
-    ]
+        "BNB listing", "BNB bullish",
+    ])
+    sentiment_threshold: float   = 0.3
+    price_diff_threshold: float  = 0.005
+    poll_interval_seconds: int   = 120
 
-    # ── Thresholds ──
-    SENTIMENT_THRESHOLD    = 0.3
-    PRICE_DIFF_THRESHOLD   = 0.005  # 0.5% — realistic for BSC
-    POLL_INTERVAL_SECONDS  = 120    # 2 min — avoids rate limits
+    def __post_init__(self) -> None:
+        """Warn on missing optional keys that degrade data quality."""
+        optional_keys = {
+            "gnews_key":        "GNEWS_KEY",
+            "cryptopanic_key":  "CRYPTOPANIC_KEY",
+            "bscscan_api_key":  "BSCSCAN_API_KEY",
+        }
+        for attr, env_key in optional_keys.items():
+            if not getattr(self, attr):
+                logger.warning("Optional key %s not set — related data source will be skipped.", env_key)
