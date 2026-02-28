@@ -1,120 +1,79 @@
-# BNB Chain AI Arbitrage Agent
+# Autonomous Arbitrage Agent on BNB Chain
 
-An AI-powered arbitrage agent for BNB Chain that monitors sentiment, on-chain intelligence, and DEX/CEX price spreads to identify and execute arbitrage opportunities on BSC Testnet.
+**BSC · MCP-Powered · Multi-Agent Pipeline · On-chain Execution**
 
-## How It Works
+This project is an AI-powered arbitrage agent on the BNB Chain that analyzes:
+- **Market data** 
+- **News sources** 
+- **On-chain activity** 
+to identify high-probability arbitrage opportunities. 
 
-1. Every 2 minutes, the agent fetches news from 10+ sources (RSS, GNews, Reddit, 4chan, CoinGecko trends, CryptoPanic)
-2. VADER scores all articles for sentiment; Gemini performs deep analysis on relevant ones
-3. On-chain intelligence checks whale wallet flows, dev activity, social growth, TVL, and holder distribution
-4. Decision agent combines all signals into a confidence score and confirms whether an arb opportunity exists
-5. If confirmed (≥0.5% DEX/CEX price diff and confidence ≥60), `ExecutionAgent` routes the trade through the BNBChain MCP server
-6. The MCP server signs and broadcasts the PancakeSwap swap on BSC Testnet using your private key
+It displays these insights through a dashboard equipped with a chatbot interface. This allows users to easily review the AI's findings and manually confirm trades. 
 
-## Decision Logic
+Once approved, the system automatically executes the transaction using Solidity smart contracts and a securely connected wallet—enabling a semi-automated, user-controlled, and highly transparent trading experience.
 
-| Condition | Action |
-|---|---|
-| `arb_confirmed = False` or `confidence < 20` | HOLD |
-| `confidence ≥ 60` | EXECUTE_TRADE |
-| `confidence ≥ 30` | PAPER_TRADE (logged only, no real tx) |
+---
 
-`arb_confirmed` triggers when **any** of:
-- Sentiment >0.3 **and** DEX/CEX diff >0.5%
-- Gemini returns `ARB_OPPORTUNITY: YES`
-- Real on-chain DEX price differs from CoinGecko by ≥0.5%
-- Momentum phase detected with >0.3% spread
 
-## Prerequisites
+## Full Architecture 
+![Main Architecture](images/main%20architecture.png)
 
-- Python 3.12+
+### Data Intelligence Layer
+![Intelligence Layer](images/intelligence%20layer.png)
+
+### Infrastructure Layer(Frontend and Backend)
+![Infrastructure](images/infrastructure.png)
+
+### Sequence Diagram
+![Sequence Diagram](images/sequence.jpeg)
+
+### Data Ingestion Agent 
+- **Price Oracles**: Real-time token prices (CoinGecko OHLCV)
+- **News & RSS Feeds**: Aggregates from GNews, TheNewsAPI, and multiple RSS feeds
+- **Web Scraping**: Custom parsers for crypto forums 
+- **Google Trends**: Search interest signals tracking retail momentum
+- **DEX Aggregators**: Multi-DEX price feeds (PancakeSwap, Biswap, 1inch)
+- **ask-ai-mcp**: Contextual RAG search across BNB Chain docs & BEPs
+
+### On-Chain Intelligence Agent 
+- **Buy/Sell Pressure**: Analyzes real-time volume
+- **Whale Wallet Flows**: BscScan large transaction tracking
+- **Social Growth Vel.**: Community momentum stats
+- **Dev Activity**: GitHub commit parsing
+- **Liquidity Changes**: DeFiLlama TVL shifts
+- **Holder Distribution**: BscScan wallet distribution
+- **Narrative Tracker & Phase Predictor**: NLP keywords predicting Accumulation, Momentum Building, Distribution, or Volatility Spikes
+
+### 4-Way Fusion Analysis Agent
+Fuses signals into a single confidence score using a LangGraph state-graph:
+- ** Gemini 2.5 Flash (45%)**: Deep narrative analysis
+- ** VADER (20%)**: Fast lexicon-based scoring
+- ** CryptoPanic (20%)**: Community news sentiment
+- ** Predict.fun (15%)**: Probabilistic forward bias
+
+### Decision Agent
+- Weighs fused 4-way sentiment against live CEX/DEX price disparities and market phase risk.
+- Outputs one of three actions: `✅ EXECUTE_TRADE`, `📋 PAPER_TRADE`, or `⏸ HOLD`
+
+### Execution Agent (MCP) + Smart Contracts
+- Safely interfaces with the blockchain via **bnbchain-mcp** (@bnb-chain/mcp Node.js).
+- **Pre-Flight Checks**: Chain liveness verify, Wallet balance check, Dry-run simulation.
+- **Circuit Breaker**: Auto-pauses on consecutive failures to protect funds.
+- **Execution**: Automates reads and writes to PancakeSwap V2 Router.
+- Uses Solidity Smart Contracts for Flash-loan enabled trades, Liquidity Position Management, Validation, and Auto Profit Distribution.
+
+### Blockchain — On-chain Settlement
+- **BSC (L1)**: Main arb venue (PancakeSwap). EVM · ~3s blocks · Low gas.
+
+---
+
+
+## 🛠 Prerequisites
+
+- Python 3.9+
 - Node.js 18+ (for the BNBChain MCP server)
 - A BSC Testnet wallet funded with tBNB — faucet: https://testnet.bnbchain.org/faucet-smart
 
-## Setup
 
-### 1. Create environment and install dependencies
 
-```powershell
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-```
 
-### 2. Configure environment variables
-
-```bash
-cp bnb_arb_agent/env.example .env
-```
-
-Fill in `.env`:
-
-```env
-# Required
-GOOGLE_API_KEY=your_gemini_api_key
-PRIVATE_KEY=your_64_char_hex_private_key     # BSC Testnet only — never use mainnet key
-WALLET_ADDRESS=0xYourWalletAddress            # Must match PRIVATE_KEY
-MCP_SERVER_URL=http://localhost:3001
-
-# Execution settings
-EXECUTION_ENABLED=true
-TRADE_AMOUNT_BNB=0.01
-MIN_PROFIT_THRESHOLD=0.005
-SLIPPAGE_TOLERANCE=0.02
-CIRCUIT_BREAKER_MAX_FAILURES=3
-CIRCUIT_BREAKER_COOLDOWN_MIN=15
-
-# Optional — improves data quality
-GNEWS_KEY=...
-CRYPTOPANIC_KEY=...
-BSCSCAN_API_KEY=...
-GITHUB_TOKEN=...
-```
-
-## Running
-
-You need **two terminals**.
-
-### Terminal 1 — BNBChain MCP server
-
-```powershell
-.\start_mcp.ps1
-```
-
-Wait for `INFO: Starting sse server on port 3001` before starting the agent.
-
-> If port 3001 is already in use:
-> ```powershell
-> Get-NetTCPConnection -LocalPort 3001 | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force }
-> .\start_mcp.ps1
-> ```
-
-### Terminal 2 — Agent
-
-```powershell
-.venv\Scripts\python.exe bnb_arb_agent\orchestrator.py
-```
-
-### Optional — Streamlit Dashboard
-
-```powershell
-.venv\Scripts\python.exe -m streamlit run bnb_arb_agent\dashboard.py
-```
-
-Open http://localhost:8501
-
-## Tests
-
-```powershell
-.venv\Scripts\python.exe -m pytest bnb_arb_agent\tests\ -v
-```
-
-20 unit tests covering decision logic and DEX price fallback chain.
-
-## Make Shortcuts
-
-```
-make run        # Run the orchestrator
-make test       # Run pytest
-make dashboard  # Launch Streamlit dashboard
-make mcp        # Start the MCP server
-```
