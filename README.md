@@ -24,6 +24,9 @@ Once approved, the system automatically executes the transaction using Solidity 
 ### Infrastructure Layer(Frontend and Backend)
 ![Infrastructure](images/infrastructure.png)
 
+### Sequence Diagram
+![Sequence Diagram](images/sequence.jpeg)
+
 ### Data Ingestion Agent 
 - **Price Oracles**: Real-time token prices (CoinGecko OHLCV)
 - **News & RSS Feeds**: Aggregates from GNews, TheNewsAPI, and multiple RSS feeds
